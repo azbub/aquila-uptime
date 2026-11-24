@@ -1,0 +1,81 @@
+# Is Aquila up? Every 5 minutes, from GitHub (a network that is neither Hetzner nor Cloudflare): the website, the API, the dashboard sign-in page and the
+# two app-link files. A failing run e-mails the repository owner (GitHub does that for a failed scheduled run) and, when the two Telegram secrets are set,
+# sends ONE Telegram message when the site goes down and ONE when it is back (not one per run).
+# This repository holds public addresses only: nothing in it is a secret.
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write # re-enables this workflow: GitHub pauses a scheduled one after 60 days without repository activity
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Keep the schedule alive
+        run: gh workflow enable uptime.yml || true
+
+      - name: Check every address
+        id: probe
+        run: |
+          set -u
+          problems=""
+          # check <name> <url> <expected status> [text the answer must contain]
+          check() {
+            local name="$1" url="$2" want="$3" text="${4:-}" code
+            code="$(curl -s -o body.txt -w '%{http_code}' --max-time 15 --retry 2 --retry-delay 5 --retry-all-errors "$url" || true)"
+            if [ "$code" != "$want" ]; then
+              problems="${problems}${name}: ${url} answered ${code:-nothing}, expected ${want}"$'\n'
+            elif [ -n "$text" ] && ! grep -q "$text" body.txt; then
+              problems="${problems}${name}: ${url} answered ${want} without \"${text}\""$'\n'
+            fi
+          }
+          check "website"          https://aquila.travel/                                        200 "<title>"
+          check "www"              https://www.aquila.travel/                                    301
+          check "API"              https://ad.aquila.travel/readyz                               200 '"status"'
+          check "dashboard"        https://813.aquila.travel/admin/login                         200 "Sign in"
+          check "Android links"    https://aquila.travel/.well-known/assetlinks.json            200 "com.rugiagele.app"
+          check "iOS links"        https://aquila.travel/.well-known/apple-app-site-association 200 "com.rugiagele.app"
+          if [ -n "$problems" ]; then
+            printf 'DOWN\n%s' "$problems"
+            { echo "status=down"; echo "problems<<EOF"; printf '%s' "$problems"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "everything answers"
+            echo "status=up" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tell Telegram when the state changes
+        if: always()
+        env:
+          NOW: ${{ steps.probe.outputs.status }}
+          PROBLEMS: ${{ steps.probe.outputs.problems }}
+        run: |
+          [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] || { echo "Telegram secrets are not set: e-mail only"; exit 0; }
+          previous="$(gh run list --workflow uptime.yml --status completed --limit 1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || true)"
+          text=""
+          if [ "${NOW:-}" = down ] && [ "$previous" != failure ]; then
+            text="$(printf 'Aquila is DOWN\n%s' "$PROBLEMS")"
+          elif [ "${NOW:-}" = up ] && [ "$previous" = failure ]; then
+            text="Aquila is back up"
+          fi
+          [ -n "$text" ] || exit 0
+          curl -s --max-time 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${text}" > /dev/null || true
+
+      - name: Fail the run when something is down
+        if: steps.probe.outputs.status != 'up'
+        run: exit 1
